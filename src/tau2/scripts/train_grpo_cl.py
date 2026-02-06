@@ -1,29 +1,12 @@
-"""Training script for GRPO-based continual learning on agent tool-use tasks.
+"""
+Training script for GRPO-based continual learning on agent tool-use tasks.
 
-This script provides a command-line interface for training agents using GRPO
-across multiple domains (airline, retail, telecom) in a continual learning setting.
-
-Usage:
-    # Single GPU
-    python -m tau2.scripts.train_grpo_cl --model_name_or_path Qwen/Qwen2.5-7B-Instruct
-
-    # Multi-GPU with torchrun
-    torchrun --nproc_per_node=4 -m tau2.scripts.train_grpo_cl \\
-        --model_name_or_path Qwen/Qwen2.5-7B-Instruct \\
-        --batch_size_per_gpu 4 \\
-        --num_steps_per_task 100
-
-    # With custom configuration
-    python -m tau2.scripts.train_grpo_cl \\
-        --model_name_or_path meta-llama/Llama-3-8B-Instruct \\
-        --batch_size_per_gpu 2 \\
-        --gradient_accumulation_steps 4 \\
-        --num_samples_per_prompt 4 \\
-        --learning_rate 1e-6 \\
-        --kl_coef 0.1 \\
-        --task_order airline retail telecom \\
-        --cl_algorithm sequential \\
-        --log_dir logs/grpo_llama3
+支持分阶段运行：
+  --phase 1      : 只运行 Zero-shot 评估
+  --phase 1.5    : 只运行单任务 baseline 评估
+  --phase 2      : 只运行持续学习训练（不含评估）
+  --phase 3      : 只运行最终评估
+  --phase all    : 运行完整流程（默认）
 """
 
 import argparse
@@ -31,150 +14,80 @@ import os
 import sys
 from pathlib import Path
 
-import torch
-
-# Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from tau2.continual_learning import GRPOConfig
 from tau2.continual_learning.grpo_trainer import GRPOTrainer
 
+
 def parse_args():
-    """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Train agents with GRPO for continual learning on tool-use tasks",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
+    # ========== 阶段选择 ==========
+    parser.add_argument(
+        "--phase",
+        type=str,
+        default="all",
+        choices=["1", "1.5", "2", "3", "all"],
+        help="Which phase to run: 1=zero-shot, 1.5=single-domain, 2=training, 3=final-eval, all=full"
+    )
+
+    # 用于加载之前阶段结果的参数
+    parser.add_argument("--load_phase1_results", type=str, default=None,
+                        help="Path to phase 1 (zero-shot) results JSON file")
+    parser.add_argument("--load_phase1_5_results", type=str, default=None,
+                        help="Path to phase 1.5 (single-domain) results JSON file")
+
     # Model configuration
-    parser.add_argument(
-        "--model_name_or_path",
-        type=str,
-        default="/data/yuweiyao/Qwen3-4B",
-        help="Path or name of the model (local path or HuggingFace model ID)",
-    )
-    parser.add_argument(
-        "--model_dtype",
-        type=str,
-        default="bfloat16",
-        choices=["bfloat16", "float16", "float32"],
-        help="Model dtype for training",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.7,
-        help="Sampling temperature for trajectory generation",
-    )
-    parser.add_argument(
-        "--max_new_tokens",
-        type=int,
-        default=2048,
-        help="Maximum number of tokens to generate per response",
-    )
-    parser.add_argument(
-        "--user_model",
-        type=str,
-        default="/data/yuweiyao/Qwen3-4B",
-        help="Model for user simulator (local path or API model name like gpt-3.5-turbo, gpt-4o-mini, gpt-4)",
-    )
-    parser.add_argument(
-        "--use_local_user_model",
-        action="store_true",
-        default=True,
-        help="Use local model for user simulator instead of API",
-    )
-    parser.add_argument(
-        "--no_local_user_model",
-        action="store_false",
-        dest="use_local_user_model",
-        help="Use API for user simulator instead of local model",
-    )
-    parser.add_argument(
-        "--user_model_temperature",
-        type=float,
-        default=0.0,
-        help="Temperature for user simulator model (fixed, not trainable)",
-    )
+    parser.add_argument("--model_name_or_path", type=str, default="/home/houzhiyan/Qwen3-4B")
+    parser.add_argument("--model_dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--max_new_tokens", type=int, default=2048)
+
+    parser.add_argument("--user_model", type=str, default="gpt_oss_120b")
+    parser.add_argument("--use_local_user_model", action="store_true", default=False)
+    parser.add_argument("--no_local_user_model", action="store_false", dest="use_local_user_model")
+    parser.add_argument("--user_model_temperature", type=float, default=0.0)
+
+    # User API configuration (中转 API)
+    parser.add_argument("--user_api_base", type=str, default="https://cloud.zidongtaichu.com/maas/v1",
+                        help="Base URL for user model API")
+    parser.add_argument("--user_api_key", type=str, default="vp8ggmuy102xmtpcyf9enr3g",
+                        help="API key for user model")
+
+    # Random seed for reproducibility
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
 
     # GRPO hyperparameters
-    parser.add_argument(
-        "--num_samples_per_prompt",
-        type=int,
-        default=4,
-        help="Number of response trajectories to generate per prompt",
-    )
-    parser.add_argument(
-        "--kl_coef",
-        type=float,
-        default=0.1,
-        help="Coefficient for KL divergence penalty",
-    )
-    parser.add_argument(
-        "--gamma",
-        type=float,
-        default=1.0,
-        help="Discount factor for rewards",
-    )
+    parser.add_argument("--num_samples_per_prompt", type=int, default=4)
+    parser.add_argument("--kl_coef", type=float, default=0.1)
+    parser.add_argument("--gamma", type=float, default=1.0)
 
     # Training configuration
-    parser.add_argument(
-        "--batch_size_per_gpu",
-        type=int,
-        default=4,
-        help="Batch size per GPU (number of tasks per GPU per step)",
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps",
-        type=int,
-        default=2,
-        help="Number of gradient accumulation steps before update",
-    )
-    parser.add_argument(
-        "--num_steps_per_task",
-        type=int,
-        default=100,
-        help="Number of training steps per task/domain",
-    )
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=1e-6,
-        help="Learning rate for optimizer",
-    )
-    parser.add_argument(
-        "--warmup_steps",
-        type=int,
-        default=10,
-        help="Number of warmup steps for learning rate scheduler",
-    )
-    parser.add_argument(
-        "--max_grad_norm",
-        type=float,
-        default=1.0,
-        help="Maximum gradient norm for clipping",
-    )
+    parser.add_argument("--batch_size_per_gpu", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
+    parser.add_argument("--num_steps_per_task", type=int, default=100)
+    parser.add_argument("--learning_rate", type=float, default=1e-6)
+    parser.add_argument("--warmup_steps", type=int, default=10)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
 
     # Continual learning configuration
     parser.add_argument(
         "--cl_algorithm",
         type=str,
         default="sequential",
-        choices=["sequential", "replay", "adaptive_replay", "ewc", "online_ewc", "ewc_pp", "progressive", "dynamic_expansion", "fusion", "adaptive_fusion"],
-        help="Continual learning algorithm",
+        choices=[
+            "sequential", "replay", "adaptive_replay",
+            "ewc", "online_ewc", "ewc_pp",
+            "progressive", "dynamic_expansion",
+            "fusion", "adaptive_fusion",
+        ],
     )
-    parser.add_argument(
-        "--replay_buffer_size",
-        type=int,
-        default=1000,
-        help="Maximum number of trajectories to store per domain",
-    )
-    parser.add_argument(
-        "--replay_ratio",
-        type=float,
-        default=0.2,
-        help="Ratio of replay samples to new samples in batch",
-    )
+    parser.add_argument("--replay_buffer_size", type=int, default=1000)
+    parser.add_argument("--replay_ratio", type=float, default=0.2)
 
     # Task configuration
     parser.add_argument(
@@ -182,147 +95,70 @@ def parse_args():
         type=str,
         nargs="+",
         default=["airline", "retail", "telecom"],
-        choices=["airline", "retail", "telecom"],
-        help="Order of tasks/domains for sequential training",
+        choices=["airline", "retail", "telecom", "delivery", "instore", "ota"],
     )
-    parser.add_argument(
-        "--max_tasks_per_domain",
-        type=int,
-        default=None,
-        help="Maximum number of tasks to use per domain (None = use all)",
-    )
-    parser.add_argument(
-        "--train_split",
-        type=float,
-        default=0.8,
-        help="Fraction of tasks to use for training (rest for evaluation)",
-    )
+    parser.add_argument("--max_tasks_per_domain", type=int, default=None)
+    parser.add_argument("--train_split", type=float, default=0.8)
 
     # Logging and checkpointing
-    parser.add_argument(
-        "--log_dir",
-        type=str,
-        default="logs/grpo_cl",
-        help="Directory for logging and checkpoints",
-    )
-    parser.add_argument(
-        "--save_interval",
-        type=int,
-        default=10,
-        help="Save checkpoint every N steps",
-    )
-    parser.add_argument(
-        "--eval_interval",
-        type=int,
-        default=5,
-        help="Evaluate every N steps",
-    )
-    parser.add_argument(
-        "--wandb_project",
-        type=str,
-        default=None,
-        help="Weights & Biases project name (None = no wandb logging)",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        default=False,
-        help="Enable verbose logging (trajectory details, etc.)",
-    )
-    parser.add_argument(
-        "--log_interval",
-        type=int,
-        default=10,
-        help="Print training metrics every N steps",
-    )
-    parser.add_argument(
-        "--use_progress_bar",
-        action="store_true",
-        default=True,
-        help="Use progress bar for training steps",
-    )
-    parser.add_argument(
-        "--no_progress_bar",
-        action="store_false",
-        dest="use_progress_bar",
-        help="Disable progress bar",
-    )
-    parser.add_argument(
-        "--save_trajectory_logs",
-        action="store_true",
-        default=True,
-        help="Save detailed trajectory logs to files",
-    )
-    parser.add_argument(
-        "--no_trajectory_logs",
-        action="store_false",
-        dest="save_trajectory_logs",
-        help="Disable trajectory logging",
-    )
-    parser.add_argument(
-        "--trajectory_log_interval",
-        type=int,
-        default=1,
-        help="Save trajectory logs every N steps (1 = every step)",
-    )
+    parser.add_argument("--log_dir", type=str, default="logs/grpo_cl")
+    parser.add_argument("--save_interval", type=int, default=10)
+    parser.add_argument("--eval_interval", type=int, default=5)
+    parser.add_argument("--verbose", action="store_true", default=False)
+    parser.add_argument("--log_interval", type=int, default=10)
+    parser.add_argument("--use_progress_bar", action="store_true", default=True)
+    parser.add_argument("--no_progress_bar", action="store_false", dest="use_progress_bar")
+    parser.add_argument("--save_trajectory_logs", action="store_true", default=True)
+    parser.add_argument("--no_trajectory_logs", action="store_false", dest="save_trajectory_logs")
+    parser.add_argument("--trajectory_log_interval", type=int, default=1)
+    parser.add_argument("--checkpoint_interval", type=int, default=5, help="Save checkpoint every N steps")
+    parser.add_argument("--skip_intermediate_eval", action="store_true", default=False,
+                        help="Skip intermediate evaluation during training")
+
+    # Evaluation configuration
+    parser.add_argument("--pass_at_k", type=int, default=1, help="k value for pass@k metric")
+    parser.add_argument("--num_eval_samples", type=int, default=5, help="Number of samples per task for evaluation")
+    parser.add_argument("--num_eval_tasks", type=int, default=20, help="Number of tasks to evaluate")
+
+    # Single-domain baseline for FWT calculation
+    parser.add_argument("--single_domain_checkpoint_dir", type=str, default=None,
+                        help="Directory containing single-domain trained checkpoints for FWT baseline")
 
     # Optimization flags
-    parser.add_argument(
-        "--use_flash_attention",
-        action="store_true",
-        default=True,
-        help="Use Flash Attention 2 for faster training",
-    )
-    parser.add_argument(
-        "--no_flash_attention",
-        action="store_false",
-        dest="use_flash_attention",
-        help="Disable Flash Attention 2",
-    )
-    parser.add_argument(
-        "--gradient_checkpointing",
-        action="store_true",
-        default=True,
-        help="Use gradient checkpointing to save memory",
-    )
-    parser.add_argument(
-        "--no_gradient_checkpointing",
-        action="store_false",
-        dest="gradient_checkpointing",
-        help="Disable gradient checkpointing",
-    )
+    parser.add_argument("--use_flash_attention", action="store_true", default=True)
+    parser.add_argument("--no_flash_attention", action="store_false", dest="use_flash_attention")
+    parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
+    parser.add_argument("--no_gradient_checkpointing", action="store_false", dest="gradient_checkpointing")
 
-    # Resuming from checkpoint
-    parser.add_argument(
-        "--resume_from",
-        type=str,
-        default=None,
-        help="Path to checkpoint directory to resume from",
-    )
+    # Resuming
+    parser.add_argument("--resume_from", type=str, default=None, help="Resume from checkpoint directory")
+    parser.add_argument("--resume_from_task", type=int, default=0, help="Resume from task index (for continual learning)")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Resume from step checkpoint")
+    parser.add_argument("--resume_from_eval_domain", type=str, default=None, help="Resume evaluation from specific domain")
+    parser.add_argument("--skip_training_for_resume_task", action="store_true", help="Skip training for resume_from_task, start from evaluation")
 
-    args = parser.parse_args()
-    return args
+    # ✅ W&B
+    parser.add_argument("--wandb_project", type=str, default=None, help="W&B project (None disables wandb)")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="W&B entity/team (optional)")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="W&B run name (optional)")
+    parser.add_argument("--wandb_tags", type=str, nargs="*", default=None, help="W&B tags (optional)")
+    parser.add_argument("--wandb_mode", type=str, default=None, choices=[None, "online", "offline", "disabled"],
+                        help="Override wandb mode (optional)")
+
+    return parser.parse_args()
 
 
 def main():
-    """Main training function."""
-    # Parse arguments first to get verbose setting
     args = parse_args()
 
-    # Suppress verbose logging from AGentCL components (unless verbose mode)
-    if not getattr(args, 'verbose', False):
+    if not getattr(args, "verbose", False):
         import logging
         from loguru import logger
-
-        # Disable loguru (used by AGentCL)
         logger.disable("AGentCL")
-
-        # Set standard logging to WARNING level
         logging.basicConfig(level=logging.WARNING)
-        for logger_name in ['AGentCL', 'tau2', 'litellm']:
+        for logger_name in ["AGentCL", "tau2", "litellm"]:
             logging.getLogger(logger_name).setLevel(logging.WARNING)
 
-    # Create configuration
     config = GRPOConfig(
         # Model
         model_name_or_path=args.model_name_or_path,
@@ -332,6 +168,11 @@ def main():
         user_model=args.user_model,
         use_local_user_model=args.use_local_user_model,
         user_model_temperature=args.user_model_temperature,
+        # User API configuration
+        user_api_base=args.user_api_base,
+        user_api_key=args.user_api_key,
+        # Random seed
+        seed=args.seed,
         # GRPO
         num_samples_per_prompt=args.num_samples_per_prompt,
         kl_coef=args.kl_coef,
@@ -355,54 +196,61 @@ def main():
         log_dir=args.log_dir,
         save_interval=args.save_interval,
         eval_interval=args.eval_interval,
-        wandb_project=args.wandb_project,
         verbose=args.verbose,
         log_interval=args.log_interval,
         use_progress_bar=args.use_progress_bar,
         save_trajectory_logs=args.save_trajectory_logs,
         trajectory_log_interval=args.trajectory_log_interval,
+        checkpoint_interval=args.checkpoint_interval,
+        skip_intermediate_eval=args.skip_intermediate_eval,
+        resume_from_checkpoint=args.resume_from_checkpoint,
+        resume_from_task=args.resume_from_task,
+        resume_from_eval_domain=args.resume_from_eval_domain,
+        skip_training_for_resume_task=args.skip_training_for_resume_task,
+        # Evaluation
+        pass_at_k=args.pass_at_k,
+        num_eval_samples=args.num_eval_samples,
+        num_eval_tasks=args.num_eval_tasks,
+        # Single-domain baseline
+        single_domain_checkpoint_dir=args.single_domain_checkpoint_dir,
         # Optimization
         use_flash_attention=args.use_flash_attention,
         gradient_checkpointing=args.gradient_checkpointing,
+        # ✅ W&B
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_run_name=args.wandb_run_name,
+        wandb_tags=args.wandb_tags,
+        wandb_mode=args.wandb_mode,
     )
 
-    # Print configuration
-    if config.local_rank == 0:
-        print("\n" + "="*80)
-        print("GRPO Continual Learning Training")
-        print("="*80)
-        print("\nConfiguration:")
-        for key, value in config.to_dict().items():
-            print(f"  {key}: {value}")
-        print("="*80 + "\n")
-
-    # Create trainer
     trainer = GRPOTrainer(config)
 
-    # Resume from checkpoint if specified
     if args.resume_from:
         trainer.load_checkpoint(args.resume_from)
 
-    # Train
     try:
-        trainer.train()
-    except KeyboardInterrupt:
-        if config.local_rank == 0:
-            print("\n\nTraining interrupted by user")
-            print("Saving checkpoint...")
-            trainer.save_checkpoint(task_idx=len(config.task_order) - 1)
-    except Exception as e:
-        if config.local_rank == 0:
-            print(f"\n\nTraining failed with error: {e}")
-            import traceback
-            traceback.print_exc()
-        raise
+        # 根据 phase 参数选择运行哪个阶段
+        if args.phase == "all":
+            trainer.train()
+        elif args.phase == "1":
+            trainer.run_phase1_zero_shot()
+        elif args.phase == "1.5":
+            trainer.run_phase1_5_single_domain(
+                load_phase1_results=args.load_phase1_results
+            )
+        elif args.phase == "2":
+            trainer.run_phase2_training(
+                load_phase1_results=args.load_phase1_results,
+                load_phase1_5_results=args.load_phase1_5_results
+            )
+        elif args.phase == "3":
+            trainer.run_phase3_final_eval(
+                load_phase1_results=args.load_phase1_results,
+                load_phase1_5_results=args.load_phase1_5_results
+            )
     finally:
-        # Cleanup
         trainer.cleanup()
-
-    if config.local_rank == 0:
-        print("\nTraining completed successfully!")
 
 
 if __name__ == "__main__":

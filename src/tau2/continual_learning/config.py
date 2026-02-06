@@ -1,186 +1,154 @@
 """Configuration for GRPO-based continual learning training."""
 
 import os
+import random
 from dataclasses import dataclass, field
 from typing import Optional
 
+import numpy as np
 import torch
+
+
+def set_all_seeds(seed: int):
+    """Set all random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
 
 
 @dataclass
 class GRPOConfig:
-    """Configuration for GRPO continual learning training.
-
-    This configuration supports:
-    - Open-source LLM models with gradient access
-    - Multi-GPU distributed training via PyTorch DDP
-    - Sequential continual learning with optional replay
-    - Comprehensive metrics tracking
-    """
-
-    # Model configuration (Open-source with gradient access)
-    model_name_or_path: str = "/data/yuweiyao/Qwen3-4B"
-    """Path or name of the model (local path or HuggingFace model ID like Qwen/Qwen2.5-7B-Instruct)"""
-
+    # Model configuration
+    model_name_or_path: str = "/home/houzhiyan/Qwen3-4B"
     model_dtype: str = "bfloat16"
-    """Model dtype for training (bfloat16, float16, float32)"""
-
     temperature: float = 0.7
-    """Sampling temperature for trajectory generation"""
-
     max_new_tokens: int = 2048
-    """Maximum number of tokens to generate per response"""
 
-    user_model: str = "/data/yuweiyao/Qwen3-4B"
-    """Model for user simulator (local path or API model name like gpt-3.5-turbo, gpt-4o-mini, gpt-4)"""
-
-    use_local_user_model: bool = True
-    """Whether to use a local model for user simulator (True) or API (False)"""
-
+    # User model configuration
+    user_model: str = "gpt_oss_120b"  # 使用紫东太初 API
+    use_local_user_model: bool = False  # 默认使用 API
     user_model_temperature: float = 0.0
-    """Temperature for user simulator model (fixed, not trainable)"""
+
+    # 紫东太初 API 配置
+    user_api_base: str = "https://cloud.zidongtaichu.com/maas/v1"
+    user_api_key: str = "vp8ggmuy102xmtpcyf9enr3g"
+
+    # Random seed for reproducibility
+    seed: int = 42
 
     # GRPO hyperparameters
     num_samples_per_prompt: int = 4
-    """Number of response trajectories to generate per prompt"""
-
     kl_coef: float = 0.1
-    """Coefficient for KL divergence penalty"""
-
     clip_range: float = 0.2
-    """Clipping range for policy updates (not used in basic GRPO)"""
-
     gamma: float = 1.0
-    """Discount factor for rewards"""
 
     # Training configuration
     batch_size_per_gpu: int = 4
-    """Batch size per GPU (number of tasks per GPU per step)"""
-
     gradient_accumulation_steps: int = 2
-    """Number of gradient accumulation steps before update"""
-
     num_steps_per_task: int = 100
-    """Number of training steps per task/domain"""
-
     learning_rate: float = 1e-6
-    """Learning rate for optimizer"""
-
     warmup_steps: int = 10
-    """Number of warmup steps for learning rate scheduler"""
-
     max_grad_norm: float = 1.0
-    """Maximum gradient norm for clipping"""
 
     # Continual Learning configuration
     cl_algorithm: str = "sequential"
-    """Continual learning algorithm (sequential, replay, adaptive_replay, ewc, online_ewc, progressive, fusion)"""
-
     replay_buffer_size: int = 1000
-    """Maximum number of trajectories to store per domain"""
-
     replay_ratio: float = 0.2
-    """Ratio of replay samples to new samples in batch"""
 
     # Task configuration
     task_order: list[str] = field(default_factory=lambda: ["airline", "retail", "telecom"])
-    """Order of tasks/domains for sequential training"""
-
     max_tasks_per_domain: Optional[int] = None
-    """Maximum number of tasks to use per domain (None = use all)"""
-
     train_split: float = 0.8
-    """Fraction of tasks to use for training (rest for evaluation)"""
 
-    # Distributed training configuration
-    world_size: int = field(default_factory=lambda: torch.cuda.device_count() if torch.cuda.is_available() else 1)
-    """Number of GPUs to use for distributed training"""
+    # Distributed (env-first)
+    world_size: int = field(default_factory=lambda: int(os.environ.get("WORLD_SIZE", "1")))
+    local_rank: int = field(default_factory=lambda: int(os.environ.get("LOCAL_RANK", "0")))
 
-    local_rank: int = field(default_factory=lambda: int(os.environ.get("LOCAL_RANK", 0)))
-    """Local rank for distributed training"""
-
-    backend: str = "nccl"
-    """Backend for distributed training (nccl, gloo)"""
-
-    # Logging and checkpointing
+    # Logging/checkpointing
     log_dir: str = "logs/grpo_cl"
-    """Directory for logging and checkpoints"""
-
     save_interval: int = 10
-    """Save checkpoint every N steps"""
-
     eval_interval: int = 5
-    """Evaluate every N steps"""
+    skip_intermediate_eval: bool = False  # 跳过训练中的中间评估，只在任务结束时评估
+    checkpoint_interval: int = 5  # 每隔多少 step 保存一次 checkpoint，用于断点续训
+    resume_from_checkpoint: Optional[str] = None  # 从指定 checkpoint 恢复训练
+    resume_from_task: int = 0  # 从第几个 task 开始训练（用于持续学习断点续训）
+    resume_from_eval_domain: Optional[str] = None  # 从指定 domain 的评估开始恢复（用于评估阶段中断恢复）
+    skip_training_for_resume_task: bool = False  # 跳过 resume_from_task 的训练，直接从评估开始
 
-    wandb_project: Optional[str] = None
-    """Weights & Biases project name (None = no wandb logging)"""
+    # 早停配置（基于训练 reward 饱和）
+    early_stopping_patience: int = 10  # 连续多少步 reward >= threshold 后停止，0 表示不启用
+    early_stopping_threshold: float = 0.8  # reward 达到此阈值视为饱和
 
-    # Logging configuration
+    # API configuration
+    user_api_timeout: int = 60  # User API 调用超时时间（秒）
+    user_api_max_retries: int = 3  # User API 调用最大重试次数
     verbose: bool = False
-    """Enable verbose logging (trajectory details, etc.)"""
-
     log_interval: int = 10
-    """Print training metrics every N steps"""
-
     use_progress_bar: bool = True
-    """Use progress bar for training steps"""
-
     save_trajectory_logs: bool = True
-    """Save detailed trajectory logs to files"""
-
     trajectory_log_interval: int = 1
-    """Save trajectory logs every N steps (1 = every step)"""
+
+    # Evaluation configuration
+    pass_at_k: int = 1  # pass@k 中的 k 值
+    num_eval_samples: int = 5  # 每个任务评估时生成的样本数
+    num_eval_tasks: int = 20  # 评估的任务数量
+
+    # Single-domain baseline checkpoints (for FWT calculation)
+    # FWT_j = 顺序训练后性能 - 单任务训练后性能
+    single_domain_checkpoint_dir: Optional[str] = None  # 单任务训练的 checkpoint 目录
 
     # Optimization flags
     use_flash_attention: bool = True
-    """Use Flash Attention 2 for faster training"""
-
     gradient_checkpointing: bool = True
-    """Use gradient checkpointing to save memory"""
+
+    # ✅ Weights & Biases
+    wandb_project: Optional[str] = None
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
+    wandb_tags: Optional[list[str]] = None
+    wandb_mode: Optional[str] = None  # online/offline/disabled
 
     def __post_init__(self):
-        """Validate configuration after initialization."""
-        # Validate model dtype
         valid_dtypes = ["bfloat16", "float16", "float32"]
         if self.model_dtype not in valid_dtypes:
             raise ValueError(f"model_dtype must be one of {valid_dtypes}, got {self.model_dtype}")
 
-        # Validate CL algorithm
-        valid_algorithms = ["sequential", "replay", "adaptive_replay", "ewc", "online_ewc", "ewc_pp", "progressive", "dynamic_expansion", "fusion", "adaptive_fusion"]
+        valid_algorithms = [
+            "sequential", "replay", "adaptive_replay",
+            "ewc", "online_ewc", "ewc_pp",
+            "progressive", "dynamic_expansion",
+            "fusion", "adaptive_fusion",
+        ]
         if self.cl_algorithm not in valid_algorithms:
             raise ValueError(f"cl_algorithm must be one of {valid_algorithms}, got {self.cl_algorithm}")
 
-        # Validate task order
-        valid_domains = ["airline", "retail", "telecom"]
+        valid_domains = ["airline", "retail", "telecom", "delivery", "instore", "ota"]
         for domain in self.task_order:
             if domain not in valid_domains:
                 raise ValueError(f"Invalid domain in task_order: {domain}. Must be one of {valid_domains}")
 
-        # Validate batch size
         if self.batch_size_per_gpu < 1:
             raise ValueError(f"batch_size_per_gpu must be >= 1, got {self.batch_size_per_gpu}")
 
-        # Validate num_samples_per_prompt
         if self.num_samples_per_prompt < 2:
             raise ValueError(f"num_samples_per_prompt must be >= 2 for GRPO, got {self.num_samples_per_prompt}")
 
-        # Validate train_split
         if not 0.0 < self.train_split < 1.0:
             raise ValueError(f"train_split must be between 0 and 1, got {self.train_split}")
 
     @property
     def global_batch_size(self) -> int:
-        """Total batch size across all GPUs."""
         return self.batch_size_per_gpu * self.world_size
 
     @property
     def effective_batch_size(self) -> int:
-        """Effective batch size after gradient accumulation."""
         return self.global_batch_size * self.gradient_accumulation_steps
 
     def to_dict(self) -> dict:
-        """Convert config to dictionary."""
-        return {
-            k: v for k, v in self.__dict__.items()
-            if not k.startswith("_")
-        }
+        return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
