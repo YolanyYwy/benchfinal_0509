@@ -1,0 +1,35 @@
+# API Keys 配置文件
+# 每行一个 key，以 # 开头的行为注释
+
+# 使用说明：
+# 1. 将你的 API keys 填写在下面（每行一个）
+# 2. 可以添加注释说明每个 key 的用途
+# 3. 使用 manage_api_keys.py 工具测试和生成配置
+
+# GPU 0 - 主要训练
+vp8ggmuy102xmtpcyf9enr3g
+
+# GPU 1
+hdijy8bupica9yfwgvmqp1vu
+
+# GPU 2
+kbc6t2syndpfo1mnn1da3zmq
+
+# GPU 3
+lbxeaufpl9ipue50gh6uuajy
+
+# GPU 4
+d98lil73czgbugl10q1d2z0d
+
+# GPU 5
+35lz7st3k33ocv3p5y2ftcj5
+
+# GPU 6
+df94r1h2gq6sdp1x60g20lw8
+
+# GPU 7
+2pc6gcfwhdqe0ajqintrpkx4
+
+# 备用 keys（可选）
+# backup_key_1
+# backup_key_2
